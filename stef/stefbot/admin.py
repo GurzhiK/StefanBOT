@@ -1,11 +1,14 @@
 from django.contrib import admin
-from .models import TelegramUser, ModelProfile, ModelPhoto, Order
+from .models import TelegramUser, ModelProfile, ModelPhoto, Order, ModelVideo
 
 
 class ModelPhotoInline(admin.TabularInline):
     model = ModelPhoto
     extra = 1
 
+class ModelVideoInline(admin.TabularInline):
+    model = ModelVideo
+    extra = 1
 
 @admin.register(TelegramUser)
 class TelegramUserAdmin(admin.ModelAdmin):
@@ -16,9 +19,13 @@ class TelegramUserAdmin(admin.ModelAdmin):
 
 @admin.register(ModelProfile)
 class ModelProfileAdmin(admin.ModelAdmin):
-    inlines = [ModelPhotoInline]
+    inlines = [ModelPhotoInline, ModelVideoInline]
     list_display = ('name', 'price')
 
+@admin.register(ModelVideo)
+class ModelVideoAdmin(admin.ModelAdmin):
+    list_display = ('model', 'video')
+    search_fields = ('model__name',)
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):

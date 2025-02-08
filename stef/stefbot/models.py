@@ -19,11 +19,19 @@ class ModelProfile(models.Model):
     def __str__(self):
         return self.name
 
-
 class ModelPhoto(models.Model):
     model = models.ForeignKey(ModelProfile, on_delete=models.CASCADE, related_name='photos')
     photo = models.ImageField(upload_to='model_photos/')
+   
+    def __str__(self):
+        return f"Фото для {self.model.name}"
+    
+class ModelVideo(models.Model):
+    model = models.ForeignKey(ModelProfile, on_delete=models.CASCADE, related_name='videos')
+    video = models.FileField(upload_to='model_videos/')
 
+    def __str__(self):
+        return f"Видео для {self.model.name}"
 
 class Order(models.Model):
     STATUS_CHOICES = [

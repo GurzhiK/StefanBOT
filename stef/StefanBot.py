@@ -2,7 +2,8 @@ import os
 import sys
 import django
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from asgiref.sync import sync_to_async
 
@@ -84,15 +85,99 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @sync_to_async
 def get_order_details(order_id):
-    """Асинхронно получает детали заказа (модель и сумму)"""
-    order = Order.objects.filter(id=order_id).select_related('model').first()
-    if order:
+    """Get all necessary order details synchronously"""
+    try:
+        order = Order.objects.select_related('model').get(id=order_id)
         return {
-            "id": order.id,
-            "model_name": order.model.name,
-            "amount": order.amount
+            'id': order.id,
+            'model_name': order.model.name,
+            'amount': order.amount,
+            'created_at': order.created_at,
+            'model_id': order.model.id,
+            'status': order.status
         }
-    return None
+    except Order.DoesNotExist:
+        return None
+    except Exception as e:
+        logger.error(f"Error getting order details: {e}")
+        return None
+
+@sync_to_async
+def get_order_data(order):
+    """Synchronously get all order data including photos"""
+    try:
+        # Get order details
+        details = {
+            'id': order.id,
+            'model_name': order.model.name,
+            'amount': order.amount,
+            'created_at': order.created_at,
+        }
+        
+        # Get photo paths more efficiently
+        photo_paths = []
+        photos = order.model.photos.all()[:5]  # Limit to 5 photos per order
+        for photo in photos:
+            if photo.photo:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(photo.photo))
+                if os.path.exists(file_path) and os.path.getsize(file_path) < 5_000_000:  # Check file size < 5MB
+                    photo_paths.append(file_path)
+        
+        details['photo_paths'] = photo_paths
+        return details
+    except Exception as e:
+        logger.error(f"Error getting order data: {e}")
+        return None
+    
+from telegram.error import TimedOut   
+
+async def send_message_with_retry(message_func, max_retries=3):
+    """Send a message with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            return await asyncio.wait_for(message_func(), timeout=30)  # 30 second timeout
+        except TimedOut:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(1)  # Wait before retry
+        except asyncio.TimeoutError:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(1)    
+
+async def create_media_group(photo_paths):
+    """Create media group from photo paths"""
+    media_group = []
+    for path in photo_paths[:10]:  # Limit to 10 photos
+        try:
+            with open(path, 'rb') as photo_file:
+                media_group.append(InputMediaPhoto(media=photo_file.read()))
+        except Exception as e:
+            logger.error(f"Error reading photo file {path}: {e}")
+            continue
+    return media_group
+
+from django.conf import settings
+
+@sync_to_async(thread_sensitive=False)
+def get_order_photos(model_id):
+    """Fetch photo file paths for a model asynchronously"""
+    try:
+        model = ModelProfile.objects.get(id=model_id)
+        photos = model.photos.all()
+        photo_paths = []
+
+        for photo in photos:
+            if photo.photo:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(photo.photo))
+                if os.path.exists(file_path):
+                    photo_paths.append(file_path)
+
+        return photo_paths
+    except Exception as e:
+        logger.error(f"Error getting photos for model {model_id}: {e}")
+        return []
+
 
 async def handle_confirm_payment(query: Update, order_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -102,7 +187,7 @@ async def handle_confirm_payment(query: Update, order_id: int, context: ContextT
             await query.answer("⚠️ Заказ не найден", show_alert=True)
             return
         
-        admin_chat_id = ""  # Укажите реальный chat_id администратора
+        admin_chat_id = ""  # ID администратора
         user = query.from_user
         admin_message = (
             f"🆕 Новый платеж!\n"
@@ -121,6 +206,43 @@ async def handle_confirm_payment(query: Update, order_id: int, context: ContextT
             "✅ Администратор уведомлен. После проверки ваш заказ будет подтвержден.",
             show_alert=True
         )
+
+        # После подтверждения оплаты отправляем и фото, и видео
+        order = await get_order_by_id(order_id)
+        if order and order.status == 'paid':
+            media_paths = await get_media_paths(order.model.id)
+            
+            if media_paths['photos'] or media_paths['videos']:
+                media_group = []
+                
+                # Add photos to media group
+                for path in media_paths['photos']:
+                    file_content = await read_file_sync(path)
+                    if file_content:
+                        media_group.append(InputMediaPhoto(media=file_content))
+
+                # Add videos to media group
+                for path in media_paths['videos']:
+                    file_content = await read_file_sync(path)
+                    if file_content:
+                        media_group.append(InputMediaVideo(media=file_content))
+
+                if media_group:
+                    # Send media in chunks of 10 (Telegram's limit)
+                    for i in range(0, len(media_group), 10):
+                        chunk = media_group[i:i + 10]
+                        try:
+                            await query.message.reply_media_group(media=chunk)
+                            if i + 10 < len(media_group):
+                                await asyncio.sleep(1)
+                        except Exception as e:
+                            logger.error(f"Error sending media group after payment: {e}")
+                            continue
+            
+            # Send confirmation message
+            await query.message.reply_text(
+                "✅ Оплата подтверждена! Все фото и видео материалы доступны выше."
+            )
     
     except Exception as e:
         logger.error(f"Ошибка в handle_confirm_payment: {e}")
@@ -129,7 +251,6 @@ async def handle_confirm_payment(query: Update, order_id: int, context: ContextT
             show_alert=True
         )
         
-# Обработчик callback-кнопок
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -146,17 +267,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith('buy_'):
             model_id = int(data.split('_')[1])
             await handle_purchase(query, model_id, context)
-        elif data == 'orders':
-            await handle_orders(query)
+        elif data == 'orders':  # Show first page by default
+            await handle_orders(query, page=0)
+        elif data.startswith('orders_page_'):  # Handle pagination
+            page = int(data.split('_')[-1])
+            await handle_orders(query, page)
+        elif data.startswith('order_'):
+            order_id = int(data.split('_')[1])
+            await handle_order_photos(query, order_id)
         elif data.startswith('confirm_payment_'):
-            order_id = int(data.split('_')[2])
+            order_id = int(data.split('_')[-1])  # Extract order ID
             await handle_confirm_payment(query, order_id, context)
     except Exception as e:
         logger.error(f"Ошибка при обработке callback: {e}")
-        await query.edit_message_caption(
-            caption="⚠️ Произошла ошибка. Попробуйте позже.",
+        await query.edit_message_text(
+            text="⚠️ Произошла ошибка. Попробуйте позже.",
             reply_markup=main_menu()
         )
+
 
 async def handle_models_list(query):
     models = await get_all_models()
@@ -241,26 +369,253 @@ async def handle_purchase(query, model_id, context):
             reply_markup=main_menu()
         )
 
-async def handle_orders(query):
-    user_id = query.from_user.id
-    orders = await get_user_orders(user_id)
-    
-    if not orders:
-        await query.edit_message_caption(
-            caption="😔 У вас пока нет оплаченных заказов.",
-            reply_markup=main_menu()
-        )
-        return
-    
-    for order in orders:
-        photos = await get_model_photos(order.model.id)
-        if photos:
-            media_group = [InputMediaPhoto(media=photo.photo.url) for photo in photos]
-            await query.message.reply_media_group(media=media_group)
+ORDERS_PER_PAGE = 5  # Number of orders per page
+
+ORDERS_PER_PAGE = 5  # Number of orders per page
+
+ORDERS_PER_PAGE = 5  # How many orders to show per page
+
+async def handle_orders(query: Update, page: int = 0):
+    try:
+        await query.answer()
+        user_id = query.from_user.id
+        orders = await get_user_orders(user_id)  # Get all paid orders
+
+        if not orders:
+            await query.message.reply_text(
+                "😔 У вас пока нет оплаченных заказов.",
+                reply_markup=main_menu()
+            )
+            return
+
+        total_orders = len(orders)
+        total_pages = max(1, (total_orders + ORDERS_PER_PAGE - 1) // ORDERS_PER_PAGE)  # Total pages
+
+        # Ensure page is in valid range
+        page = max(0, min(page, total_pages - 1))
+
+        # Get the orders for this page
+        start_idx = page * ORDERS_PER_PAGE
+        end_idx = start_idx + ORDERS_PER_PAGE
+        paginated_orders = orders[start_idx:end_idx]
+
+        # Generate buttons
+        buttons = [[InlineKeyboardButton(f"📦 Заказ #{order.id}", callback_data=f"order_{order.id}")] for order in paginated_orders]
+
+        # Pagination buttons
+        pagination_buttons = []
+        if page > 0:
+            pagination_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"orders_page_{page - 1}"))
+        if end_idx < total_orders:
+            pagination_buttons.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"orders_page_{page + 1}"))
+
+        if pagination_buttons:
+            buttons.append(pagination_buttons)
+
+        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')])
+
+        # Check if we can edit the existing message
+        try:
+            await query.edit_message_text(
+                text=f"📦 Ваши оплаченные заказы ({page + 1}/{total_pages}):",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except:
+            await query.message.reply_text(
+                text=f"📦 Ваши оплаченные заказы ({page + 1}/{total_pages}):",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+    except Exception as e:
+        logger.error(f"Error in handle_orders: {e}")
         await query.message.reply_text(
-            f"✅ Ваш заказ на {order.model.name} подтверждён!",
+            "⚠️ Ошибка загрузки заказов. Попробуйте позже.",
             reply_markup=main_menu()
         )
+
+@sync_to_async
+def get_media_paths(model_id):
+    """Get photo and video paths synchronously"""
+    from stefbot.models import ModelProfile
+    try:
+        model = ModelProfile.objects.get(id=model_id)
+        media_paths = {
+            'photos': [],
+            'videos': []
+        }
+        
+        # Get photo paths
+        for photo in model.photos.all():
+            if photo.photo:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(photo.photo))
+                if os.path.exists(file_path):
+                    media_paths['photos'].append(str(file_path))
+                    
+        # Get video paths
+        for video in model.videos.all():
+            if video.video:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(video.video))
+                if os.path.exists(file_path):
+                    media_paths['videos'].append(str(file_path))
+                    
+        return media_paths
+    except Exception as e:
+        logger.error(f"Error getting media paths: {e}")
+        return {'photos': [], 'videos': []}
+
+@sync_to_async
+def get_full_order_data(order_id):
+    """Get order and related model data synchronously"""
+    from stefbot.models import Order
+    try:
+        order = Order.objects.select_related('model').get(id=order_id)
+        return {
+            'model_id': order.model.id,
+            'exists': True
+        }
+    except Order.DoesNotExist:
+        return {'exists': False}
+    except Exception as e:
+        logger.error(f"Error getting order data: {e}")
+        return {'exists': False}
+
+@sync_to_async
+def get_photo_paths(model_id):
+    """Get photo paths synchronously"""
+    from stefbot.models import ModelProfile
+    try:
+        model = ModelProfile.objects.get(id=model_id)
+        paths = []
+        for photo in model.photos.all():
+            if photo.photo:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(photo.photo))
+                if os.path.exists(file_path):
+                    paths.append(str(file_path))
+        return paths
+    except Exception as e:
+        logger.error(f"Error getting photo paths: {e}")
+        return []
+
+@sync_to_async
+def read_file_sync(path):
+    """Read file synchronously"""
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        logger.error(f"Error reading file {path}: {e}")
+        return None      
+
+@sync_to_async(thread_sensitive=False)
+def get_order_photos(model_id):
+    """Fetch photo file paths for a model asynchronously"""
+    try:
+        model = ModelProfile.objects.get(id=model_id)  # ✅ Fetch model safely
+        photos = model.photos.all()  # ✅ Get all related photos
+
+        photo_paths = []
+        for photo in photos:
+            if photo.photo:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(photo.photo))
+                if os.path.exists(file_path):
+                    photo_paths.append(file_path)
+
+        return photo_paths
+    except Exception as e:
+        logger.error(f"Error getting photos for model {model_id}: {e}")
+        return []
+
+import pathlib
+
+@sync_to_async
+def fetch_order_photos(model_id):
+    """Asynchronously fetch photo paths for a model"""
+    from stefbot.models import ModelProfile
+    try:
+        model = ModelProfile.objects.get(id=model_id)
+        photos = model.photos.all()
+        photo_paths = []
+
+        for photo in photos:
+            if photo.photo:
+                file_path = os.path.join(settings.MEDIA_ROOT, str(photo.photo))
+                if os.path.exists(file_path):
+                    logger.info(f"✅ Found file: {file_path}")
+                    photo_paths.append(str(file_path))
+                else:
+                    logger.warning(f"❌ Missing file: {file_path}")
+
+        return photo_paths
+    except Exception as e:
+        logger.error(f"Error fetching photos for model {model_id}: {e}")
+        return []
+
+async def read_photo_file(path):
+    """Asynchronously read photo file"""
+    try:
+        path_obj = pathlib.Path(path)
+        if path_obj.exists() and path_obj.is_file():
+            # Use asyncio.to_thread for Python 3.9+ or run_in_executor for older versions
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: open(str(path_obj), 'rb').read())
+    except Exception as e:
+        logger.error(f"Error reading photo file {path}: {e}")
+        return None
+
+async def handle_order_photos(query, order_id):
+    """Handle order photos and videos viewing"""
+    try:
+        # Get order data
+        order_data = await get_full_order_data(order_id)
+        
+        if not order_data['exists']:
+            await query.answer("⚠️ Заказ не найден", show_alert=True)
+            return
+
+        # Get media paths
+        media_paths = await get_media_paths(order_data['model_id'])
+        
+        if not media_paths['photos'] and not media_paths['videos']:
+            await query.answer("⚠️ Медиафайлы не найдены", show_alert=True)
+            return
+
+        # Process photos
+        media_group = []
+        
+        # Add photos to media group
+        for path in media_paths['photos']:
+            file_content = await read_file_sync(path)
+            if file_content:
+                media_group.append(InputMediaPhoto(media=file_content))
+
+        # Add videos to media group
+        for path in media_paths['videos']:
+            file_content = await read_file_sync(path)
+            if file_content:
+                media_group.append(InputMediaVideo(media=file_content))
+
+        if not media_group:
+            await query.answer("⚠️ Не удалось загрузить медиафайлы", show_alert=True)
+            return
+
+        # Send media in chunks of 10 (Telegram's limit)
+        for i in range(0, len(media_group), 10):
+            chunk = media_group[i:i + 10]
+            try:
+                await query.message.reply_media_group(media=chunk)
+                # Add small delay between chunks if needed
+                if i + 10 < len(media_group):
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Error sending media group: {e}")
+                continue
+
+        await query.answer("✅ Медиафайлы загружены")
+
+    except Exception as e:
+        logger.error(f"Error in handle_order_photos for order {order_id}: {e}")
+        await query.answer("⚠️ Произошла ошибка при загрузке медиафайлов", show_alert=True)
+
 
 # Запуск бота
 if __name__ == "__main__":
