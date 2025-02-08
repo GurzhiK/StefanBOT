@@ -9,7 +9,7 @@ A Django project integrated with a Telegram bot (`StefanBot.py`).
 
 1. **Clone the repo:**
    ```bash
-   git clone https://github.com/yourusername/StefanBot.git
+   git clone https://github.com/GuzhiK/StefanBot.git
    cd StefanBot
    ```
 
